@@ -4,6 +4,7 @@ using BankingApi.EventReceiver;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -11,9 +12,11 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace BankingApi.EventReceiver.Migrations
 {
     [DbContext(typeof(BankingApiDbContext))]
-    partial class BankingApiDbContextModelSnapshot : ModelSnapshot
+    [Migration("20250818191429_AddTransactionMessage")]
+    partial class AddTransactionMessage
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
