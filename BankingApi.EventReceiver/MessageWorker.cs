@@ -7,19 +7,20 @@ namespace BankingApi.EventReceiver
     public class MessageWorker
     {
         private readonly IServiceBusReceiver _receiver;
+        private readonly IDbContextFactory<BankingApiDbContext> _dbFactory;
 
-        // exponential delays in seconds for transient failures
         private static readonly int[] RetryBackoffsSeconds = new[] { 5, 25, 125 };
 
-        public MessageWorker(IServiceBusReceiver serviceBusReceiver)
+        public MessageWorker(IServiceBusReceiver receiver,
+                             IDbContextFactory<BankingApiDbContext> dbFactory)
         {
-            _receiver = serviceBusReceiver;
+            _receiver = receiver;
+            _dbFactory = dbFactory;
         }
 
-        public async Task Start()
+        public async Task Start(CancellationToken ct = default)
         {
-            // In a real service you’d pass a CancellationToken; the test harness can keep this simple loop.
-            while (true)
+            while (!ct.IsCancellationRequested)
             {
                 EventMessage? msg = null;
 
@@ -29,13 +30,12 @@ namespace BankingApi.EventReceiver
 
                     if (msg is null)
                     {
-                        await Task.Delay(TimeSpan.FromSeconds(10));
+                        await Task.Delay(TimeSpan.FromSeconds(10), ct);
                         continue;
                     }
 
                     if (string.IsNullOrWhiteSpace(msg.MessageBody))
                     {
-                        // Malformed: no body -> non-transient
                         await _receiver.MoveToDeadLetter(msg);
                         continue;
                     }
@@ -43,12 +43,12 @@ namespace BankingApi.EventReceiver
                     TransactionEvent? payload;
                     try
                     {
-                        payload = JsonSerializer.Deserialize<TransactionEvent>(msg.MessageBody,
+                        payload = JsonSerializer.Deserialize<TransactionEvent>(
+                            msg.MessageBody,
                             new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                     }
                     catch
                     {
-                        // Bad JSON -> non-transient
                         await _receiver.MoveToDeadLetter(msg);
                         continue;
                     }
@@ -59,23 +59,22 @@ namespace BankingApi.EventReceiver
                         continue;
                     }
 
-                    // Only Credit/Debit are supported
                     var kind = payload.messageType?.Trim();
-                    if (!string.Equals(kind, "Credit", StringComparison.OrdinalIgnoreCase) &&
-                        !string.Equals(kind, "Debit", StringComparison.OrdinalIgnoreCase))
+                    var isCredit = string.Equals(kind, "Credit", StringComparison.OrdinalIgnoreCase);
+                    var isDebit = string.Equals(kind, "Debit", StringComparison.OrdinalIgnoreCase);
+                    if (!isCredit && !isDebit)
                     {
                         await _receiver.MoveToDeadLetter(msg);
                         continue;
                     }
 
-                    // Process inside a transaction with idempotency insert-first pattern
-                    using var db = new BankingApi.EventReceiver.BankingApiDbContext();
-                    using var tx = await db.Database.BeginTransactionAsync();
+                    await using var db = await _dbFactory.CreateDbContextAsync(ct);
+                    await using var tx = await db.Database.BeginTransactionAsync(ct);
 
                     try
                     {
-                        // 1) Insert into Inbox as "claim" for idempotency. If duplicate -> already processed.
-                        db.TransactionMessages.Add(new TransactionMessage
+                        // Insert-first idempotency (audit)
+                        db.Set<TransactionMessage>().Add(new TransactionMessage
                         {
                             Id = payload.id,
                             BankAccountId = payload.bankAccountId,
@@ -86,36 +85,32 @@ namespace BankingApi.EventReceiver
 
                         try
                         {
-                            await db.SaveChangesAsync();
+                            await db.SaveChangesAsync(ct);
                         }
                         catch (DbUpdateException)
                         {
-                            // Unique PK violation => already processed by some other worker
+                            // duplicate MessageId => already processed
                             await _receiver.Complete(msg);
-                            await tx.RollbackAsync();
+                            await tx.RollbackAsync(ct);
                             continue;
                         }
 
-                        // 2) Apply atomic balance update
-                        var delta = string.Equals(kind, "Credit", StringComparison.OrdinalIgnoreCase)
-                            ? payload.amount
-                            : -payload.amount;
+                        var delta = isCredit ? payload.amount : -payload.amount;
 
-                        // Single-row atomic update. RowsAffected==0 -> missing account -> non-transient
-                        var affected = await db.Database.ExecuteSqlInterpolatedAsync(
-                            $"UPDATE BankAccounts SET Balance = Balance + {delta} WHERE Id = {payload.bankAccountId}");
+                        var affected = await db.BankAccounts
+                            .Where(a => a.Id == payload.bankAccountId)
+                            .ExecuteUpdateAsync(setters =>
+                                setters.SetProperty(a => a.Balance, a => a.Balance + delta),
+                                ct);
 
                         if (affected == 0)
                         {
-                            // No such account: business/data error -> non-transient
-                            await tx.RollbackAsync();
+                            await tx.RollbackAsync(ct);
                             await _receiver.MoveToDeadLetter(msg);
                             continue;
                         }
 
-                        await tx.CommitAsync();
-
-                        // Done
+                        await tx.CommitAsync(ct);
                         await _receiver.Complete(msg);
                     }
                     catch (Exception ex) when (TransientDetector.IsTransient(ex))
@@ -126,14 +121,12 @@ namespace BankingApi.EventReceiver
                     }
                     catch
                     {
-                        // Non-transient processing failure
                         await _receiver.MoveToDeadLetter(msg);
                     }
                 }
                 catch
                 {
-                    // Defensive outer catch: if we fail before we touched the message, wait briefly to avoid tight loop.
-                    await Task.Delay(TimeSpan.FromSeconds(2));
+                    await Task.Delay(TimeSpan.FromSeconds(2), ct);
                 }
             }
         }
