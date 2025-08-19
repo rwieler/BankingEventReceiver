@@ -68,11 +68,15 @@ namespace BankingApi.EventReceiver
                         continue;
                     }
 
-                    await using var db = await _dbFactory.CreateDbContextAsync(ct);
-                    await using var tx = await db.Database.BeginTransactionAsync(ct);
+                    // start auto lock-renew if the receiver supports it
+                    using var renewCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    var renewTask = StartLockRenewalIfSupported(_receiver, msg, renewCts.Token);
 
                     try
                     {
+                        await using var db = await _dbFactory.CreateDbContextAsync(ct);
+                        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
                         // Insert-first idempotency (audit)
                         db.Set<TransactionMessage>().Add(new TransactionMessage
                         {
@@ -111,16 +115,29 @@ namespace BankingApi.EventReceiver
                         }
 
                         await tx.CommitAsync(ct);
+
+                        // stop renewing before we complete
+                        renewCts.Cancel();
+                        if (renewTask is not null) { try { await renewTask; } catch { /* swallow */ } }
+
                         await _receiver.Complete(msg);
                     }
                     catch (Exception ex) when (TransientDetector.IsTransient(ex))
                     {
+                        // stop renewal before rescheduling
+                        renewCts.Cancel();
+                        if (renewTask is not null) { try { await renewTask; } catch { } }
+
                         var attempt = Math.Min(msg.ProcessingCount, RetryBackoffsSeconds.Length - 1);
                         var delay = TimeSpan.FromSeconds(RetryBackoffsSeconds[attempt]);
                         await _receiver.ReSchedule(msg, DateTime.UtcNow.Add(delay));
                     }
                     catch
                     {
+                        // stop renewal before DLQ
+                        renewCts.Cancel();
+                        if (renewTask is not null) { try { await renewTask; } catch { } }
+
                         await _receiver.MoveToDeadLetter(msg);
                     }
                 }
@@ -129,6 +146,45 @@ namespace BankingApi.EventReceiver
                     await Task.Delay(TimeSpan.FromSeconds(2), ct);
                 }
             }
+        }
+
+        /// <summary>
+        /// Starts a background task that periodically renews the message lock until the token is cancelled.
+        /// Returns null if the receiver doesn't support lock renewal.
+        /// </summary>
+        private static Task? StartLockRenewalIfSupported(IServiceBusReceiver receiver, EventMessage msg, CancellationToken ct)
+        {
+            if (receiver is not IServiceBusReceiverWithLock withLock)
+                return null;
+
+            // Renew roughly every third of the lock window, but at least every 5 seconds.
+            var period = withLock.DefaultLockDuration;
+            if (period <= TimeSpan.Zero) period = TimeSpan.FromSeconds(30);
+            var renewEvery = TimeSpan.FromSeconds(Math.Max(5, Math.Floor(period.TotalSeconds / 3)));
+
+            return Task.Run(async () =>
+            {
+                try
+                {
+                    // Small initial delay so ultra-fast messages don't renew unnecessarily
+                    await Task.Delay(renewEvery, ct);
+
+                    while (!ct.IsCancellationRequested)
+                    {
+                        await withLock.RenewLock(msg, ct);
+                        await Task.Delay(renewEvery, ct);
+                    }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    // normal shutdown
+                }
+                catch
+                {
+                    // In production, log renewal failures here. The main flow will still try to complete;
+                    // if the lock is already lost, Complete() may fail and the message will be retried per SB policy.
+                }
+            }, ct);
         }
     }
 }

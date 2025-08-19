@@ -2,10 +2,13 @@
 
 namespace BankingApi.EventReceiver
 {
-    public class FakeServiceBusReceiver : IServiceBusReceiver
+    public class FakeServiceBusReceiver : IServiceBusReceiverWithLock
     {
         private readonly ConcurrentQueue<EventMessage> _queue = new();
         private readonly List<(EventMessage msg, DateTime notBefore)> _scheduled = new();
+
+        public TimeSpan DefaultLockDuration => TimeSpan.FromSeconds(30);
+        public Task RenewLock(EventMessage message, CancellationToken ct) => Task.CompletedTask;
 
         public void Enqueue(params EventMessage[] messages)
         {
